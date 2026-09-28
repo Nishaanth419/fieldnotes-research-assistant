@@ -119,6 +119,21 @@
     .sources a { color: var(--green); overflow-wrap: anywhere; }
     .error { display: none; padding: 12px 13px; background: #fbefec; color: var(--red); border-radius: 8px; font-size: 12px; margin-top: 14px; }
     .error.show { display: block; }
+    .recovery {
+      display: none; margin-top: 10px; padding: 8px 11px; border: 1px solid #d5b9ae;
+      border-radius: 8px; color: var(--red); background: #fffaf7; cursor: pointer;
+      font-weight: 650; font-size: 11px;
+    }
+    .recovery.show { display: inline-flex; }
+    .provider-health {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      margin: -10px 0 24px; color: #667169; font-size: 11px;
+    }
+    .provider-health strong { color: #46534a; }
+    .provider-indicator { background: #ebece6; padding: 5px 9px; border-radius: 99px; }
+    .provider-indicator[data-status="ok"] { color: var(--green); background: var(--green-soft); }
+    .provider-indicator[data-status="error"] { color: var(--red); background: #fbefec; }
+    .health-refresh { border: 0; padding: 4px; color: var(--green); background: transparent; cursor: pointer; }
     .spinner { width: 12px; height: 12px; border: 2px solid rgba(255,255,255,.4); border-top-color: white; border-radius: 50%; animation: spin .8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (max-width: 820px) {
@@ -152,6 +167,12 @@
         <h1>Understand heat.<br>Build resilience.</h1>
         <p>Research urban heat risks, public-health impacts, and adaptation strategies with a team that searches trusted climate and health sources, checks its evidence, and brings you a cited report.</p>
       </section>
+      <div class="provider-health" id="provider-health" aria-live="polite">
+        <strong>Service checks</strong>
+        <span class="provider-indicator" id="ollama-health">Ollama: checking</span>
+        <span class="provider-indicator" id="tavily-health">Tavily: checking</span>
+        <button type="button" class="health-refresh" id="refresh-health">Refresh checks</button>
+      </div>
 
       <div class="workspace">
         <section class="panel main-panel">
@@ -172,6 +193,7 @@
               <button id="start-button" class="primary" type="submit"><span>Begin research</span><span class="arrow" aria-hidden="true">↗</span></button>
             </div>
             <div id="error" class="error" role="alert"></div>
+            <button id="resume-button" type="button" class="recovery">Resume saved research</button>
           </form>
 
           <section id="progress" class="results" aria-live="polite">
@@ -215,11 +237,13 @@
     const reviewPanel = document.querySelector("#review-panel");
     const findings = document.querySelector("#findings");
     const approveButton = document.querySelector("#approve-button");
+    const resumeButton = document.querySelector("#resume-button");
     const reportElement = document.querySelector("#report");
     const errorElement = document.querySelector("#error");
     let threadId = null;
     let eventCursor = 0;
     let eventSource = null;
+    let reconnectAttempts = 0;
 
     document.querySelectorAll(".suggestion").forEach((button) => {
       button.addEventListener("click", () => {
@@ -235,11 +259,47 @@
         : '<span>Begin research</span><span class="arrow" aria-hidden="true">↗</span>';
     }
 
-    function showError(message) {
+    function showError(message, resumable = false) {
       errorElement.textContent = message;
       errorElement.classList.add("show");
+      resumeButton.classList.toggle("show", resumable && Boolean(threadId));
       setBusy(false);
       approveButton.disabled = false;
+    }
+
+    function responseError(payload, fallback) {
+      const error = payload.error;
+      if (typeof error === "string") return error;
+      return [error?.message, error?.action].filter(Boolean).join(" ") || fallback;
+    }
+
+    async function refreshHealth() {
+      const ollamaIndicator = document.querySelector("#ollama-health");
+      const tavilyIndicator = document.querySelector("#tavily-health");
+      ollamaIndicator.dataset.status = "";
+      tavilyIndicator.dataset.status = "";
+      ollamaIndicator.textContent = "Ollama: checking";
+      tavilyIndicator.textContent = "Tavily: checking";
+      try {
+        const response = await fetch("/api/health");
+        const health = await response.json();
+        for (const [provider, indicator] of [
+          ["ollama", ollamaIndicator],
+          ["tavily", tavilyIndicator],
+        ]) {
+          const result = health.providers?.[provider];
+          indicator.dataset.status = result?.status === "ok" ? "ok" : "error";
+          indicator.textContent = result?.status === "ok"
+            ? `${provider === "ollama" ? "Ollama" : "Tavily"}: ready`
+            : `${provider === "ollama" ? "Ollama" : "Tavily"}: ${result?.error?.message || "unavailable"}`;
+          indicator.title = result?.error?.action || "";
+        }
+      } catch {
+        ollamaIndicator.dataset.status = "error";
+        tavilyIndicator.dataset.status = "error";
+        ollamaIndicator.textContent = "Ollama: health check unavailable";
+        tavilyIndicator.textContent = "Tavily: health check unavailable";
+      }
     }
 
     function addAgentEvent(name, update) {
@@ -282,6 +342,9 @@
     function connectEvents() {
       eventSource?.close();
       eventSource = new EventSource(`/api/events/${encodeURIComponent(threadId)}?after=${eventCursor}`);
+      eventSource.onopen = () => {
+        reconnectAttempts = 0;
+      };
       eventSource.onmessage = (message) => {
         eventCursor = Number(message.lastEventId);
         const event = JSON.parse(message.data);
@@ -299,13 +362,50 @@
           renderReport(event.report);
         } else if (event.type === "error") {
           eventSource.close();
-          showError(event.message || "The research run failed.");
+          showError(
+            [event.message, event.action].filter(Boolean).join(" ") || "The research run failed.",
+            event.resumable,
+          );
         }
       };
-      eventSource.onerror = () => {
+      eventSource.onerror = async () => {
         eventSource.close();
         if (!reviewPanel.hidden || reportElement.classList.contains("show")) return;
-        showError("The connection to the research server was interrupted. Please try again.");
+        reconnectAttempts += 1;
+        try {
+          const response = await fetch(`/api/research/${encodeURIComponent(threadId)}`);
+          const savedRun = await response.json();
+          if (!response.ok) throw new Error(responseError(savedRun, "Run status check failed."));
+          if (savedRun.status === "waiting_review") {
+            showReview(savedRun);
+            return;
+          }
+          if (savedRun.status === "complete") {
+            setBusy(false);
+            renderReport(savedRun.report);
+            return;
+          }
+          if (savedRun.status === "interrupted" || savedRun.status === "error") {
+            showError(
+              [savedRun.message || savedRun.error?.message, savedRun.action || savedRun.error?.action]
+                .filter(Boolean)
+                .join(" ") || "The run was interrupted.",
+              savedRun.resumable,
+            );
+            return;
+          }
+          if (savedRun.status === "running" && reconnectAttempts <= 5) {
+            window.setTimeout(connectEvents, 1000);
+            return;
+          }
+          showError("Could not reconnect to the research run. Try resuming it.");
+        } catch (error) {
+          if (reconnectAttempts <= 5) {
+            window.setTimeout(connectEvents, 1000);
+            return;
+          }
+          showError(`${error.message} Refresh the page to restore the saved run.`, true);
+        }
       };
     }
 
@@ -397,7 +497,11 @@
           setBusy(true, "Research in progress");
           connectEvents();
         } else {
-          showError(savedRun.message || "This run was interrupted. Start a new research run.");
+          showError(
+            [savedRun.message, savedRun.action].filter(Boolean).join(" ")
+              || "This run was interrupted.",
+            savedRun.resumable,
+          );
         }
       } catch {
         showError("Could not restore the saved research run.");
@@ -421,7 +525,7 @@
           body: JSON.stringify({ question: question.value }),
         });
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "Could not start research.");
+        if (!response.ok) throw new Error(responseError(payload, "Could not start research."));
         threadId = payload.thread_id;
         localStorage.setItem("fieldnotes.thread_id", threadId);
         progress.classList.add("show");
@@ -432,7 +536,33 @@
       }
     });
 
+    resumeButton.addEventListener("click", async () => {
+      errorElement.classList.remove("show");
+      resumeButton.disabled = true;
+      resumeButton.textContent = "Resuming saved research…";
+      try {
+        const response = await fetch(`/api/research/${encodeURIComponent(threadId)}/resume`, {
+          method: "POST",
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(responseError(payload, "Could not resume this run."));
+        resumeButton.classList.remove("show");
+        resumeButton.disabled = false;
+        resumeButton.textContent = "Resume saved research";
+        eventCursor = 0;
+        progress.classList.add("show");
+        setBusy(true, "Research in progress");
+        connectEvents();
+      } catch (error) {
+        resumeButton.disabled = false;
+        resumeButton.textContent = "Resume saved research";
+        showError(error.message, true);
+      }
+    });
+
     restorePreviousRun();
+    document.querySelector("#refresh-health").addEventListener("click", refreshHealth);
+    refreshHealth();
 
     approveButton.addEventListener("click", async () => {
       errorElement.classList.remove("show");
@@ -446,7 +576,7 @@
           body: JSON.stringify({ findings: parsedFindings }),
         });
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "Could not submit your review.");
+        if (!response.ok) throw new Error(responseError(payload, "Could not submit your review."));
         reviewPanel.hidden = true;
         document.querySelector("#progress-title").textContent = "Synthesizer is writing the report.";
         document.querySelector("#progress-badge").textContent = "IN PROGRESS";
