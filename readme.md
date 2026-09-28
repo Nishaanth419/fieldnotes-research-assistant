@@ -63,6 +63,21 @@ If Ollama is not running, start it in another terminal with `ollama serve`.
 .venv/bin/python main.py
 ```
 
+## Run automated tests
+
+Install development dependencies and run the deterministic test suite:
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+The Ollama schema-binding test runs without making a model request. To also test actual local inference, ensure Ollama is running and the configured model is installed, then run:
+
+```bash
+RUN_LOCAL_MODEL_TESTS=1 .venv/bin/python -m pytest -m ollama
+```
+
 ## Review and configuration
 
 Before the report is written, the workflow pauses. In the web app, inspect or edit the findings JSON and choose **Approve & write report** to resume synthesis.
