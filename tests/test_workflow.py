@@ -24,6 +24,7 @@ def _initial_state() -> AgentState:
 
 def test_critic_retries_then_pauses_for_editable_human_review(
     monkeypatch: Any,
+    tmp_path: Any,
 ) -> None:
     """Retry low-quality research, pause before synthesis, then resume edited evidence."""
     calls = {"researcher": 0, "critic": 0, "synthesizer": 0}
@@ -63,7 +64,9 @@ def test_critic_retries_then_pauses_for_editable_human_review(
     monkeypatch.setattr(workflow, "critic_agent", critic)
     monkeypatch.setattr(workflow, "synthesizer_agent", synthesizer)
 
-    graph = workflow.build_research_graph()
+    graph = workflow.build_research_graph(
+        checkpoint_db_path=tmp_path / "retry-review.sqlite"
+    )
     config = {"configurable": {"thread_id": "retry-review-test"}}
     list(graph.stream(_initial_state(), config, stream_mode="updates"))
 
@@ -82,6 +85,73 @@ def test_critic_retries_then_pauses_for_editable_human_review(
     assert completed_state.next == ()
     assert completed_state.values["final_report"]["findings"] == edited_findings
     assert calls["synthesizer"] == 1
+
+
+def test_sqlite_checkpoint_survives_graph_recreation(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    """Restore a paused run in a new graph instance and complete with edited evidence."""
+    calls = {"synthesizer": 0}
+    subtasks = ["heat exposure", "health impacts", "adaptation options"]
+
+    def planner(state: AgentState) -> dict[str, list[str]]:
+        return {"subtasks": subtasks}
+
+    def researcher(state: AgentState) -> dict[str, Any]:
+        return {
+            "findings": {
+                task: [{"title": f"Evidence for {task}", "url": "https://source.test"}]
+                for task in subtasks
+            },
+            "research_round": state["research_round"] + 1,
+        }
+
+    def critic(state: AgentState) -> dict[str, Any]:
+        return {
+            "quality_score": 4,
+            "task_reviews": [],
+            "critic_feedback": "Evidence is sufficient",
+            "needs_research": False,
+        }
+
+    def synthesizer(state: AgentState) -> dict[str, Any]:
+        calls["synthesizer"] += 1
+        return {"final_report": {"findings": state["findings"]}}
+
+    monkeypatch.setattr(workflow, "planner_agent", planner)
+    monkeypatch.setattr(workflow, "researcher_agent", researcher)
+    monkeypatch.setattr(workflow, "critic_agent", critic)
+    monkeypatch.setattr(workflow, "synthesizer_agent", synthesizer)
+
+    database_path = tmp_path / "persistent-research.sqlite"
+    config = {"configurable": {"thread_id": "sqlite-restart-test"}}
+    first_graph = workflow.build_research_graph(checkpoint_db_path=database_path)
+    list(first_graph.stream(_initial_state(), config, stream_mode="updates"))
+
+    first_snapshot = first_graph.get_state(config)
+    assert first_snapshot.next == ("human_in_the_loop",)
+    saved_findings = first_snapshot.values["findings"]
+    assert saved_findings["health impacts"][0]["title"] == "Evidence for health impacts"
+    first_graph.checkpointer.conn.close()
+
+    restarted_graph = workflow.build_research_graph(checkpoint_db_path=database_path)
+    restored_snapshot = restarted_graph.get_state(config)
+    assert restored_snapshot.next == ("human_in_the_loop",)
+    assert restored_snapshot.values["findings"] == saved_findings
+    assert restored_snapshot.values["user_question"] == _initial_state()["user_question"]
+
+    edited_findings = {
+        "health impacts": [{"title": "Reviewed source", "url": "https://reviewed.test"}]
+    }
+    restarted_graph.update_state(config, {"findings": edited_findings})
+    list(restarted_graph.stream(None, config, stream_mode="updates"))
+
+    completed_snapshot = restarted_graph.get_state(config)
+    assert completed_snapshot.next == ()
+    assert completed_snapshot.values["final_report"]["findings"] == edited_findings
+    assert calls["synthesizer"] == 1
+    restarted_graph.checkpointer.conn.close()
 
 
 def test_retry_stops_when_maximum_research_round_is_reached() -> None:

@@ -9,6 +9,7 @@ A local, multi-agent research assistant focused on urban heat resilience and cli
 - **Critic:** rates relevance and completeness, requesting another research round when evidence is weak.
 - **Human review:** pauses before synthesis so you can inspect and edit the gathered findings.
 - **Synthesizer:** writes a structured report using the reviewed findings.
+- **Persistent checkpoints:** stores graph state in SQLite so paused reviews and completed reports survive server restarts.
 
 By default, Tavily is restricted to these urban climate, public-health, government, and research domains:
 
@@ -56,6 +57,7 @@ RESEARCH_PORT=8766 .venv/bin/python webapp.py
 The app binds to `127.0.0.1` by default. Ollama must be running locally with the selected model; a research run also requires a valid Tavily key.
 
 If Ollama is not running, start it in another terminal with `ollama serve`.
+Graph checkpoints are saved by default at `data/research_checkpoints.sqlite`. Set `CHECKPOINT_DB_PATH` in `.env` to choose another location. The browser remembers the latest run ID so a paused review or completed report can be restored after restarting the app in the same browser. Keep the database private because it contains research questions and collected findings; it is excluded by `.gitignore`.
 
 ## Run the terminal interface
 
@@ -84,5 +86,6 @@ Before the report is written, the workflow pauses. In the web app, inspect or ed
 
 - `OLLAMA_MODEL`: local Ollama model (default: `llama3.1:8b`).
 - `OLLAMA_BASE_URL`: local Ollama server URL (default: `http://127.0.0.1:11434`).
+- `CHECKPOINT_DB_PATH`: SQLite workflow checkpoint file (default: `data/research_checkpoints.sqlite`).
 - `TAVILY_INCLUDE_DOMAINS`: optional comma-separated allowlist replacing the built-in urban climate sources.
 - `RESEARCH_PORT`: optional local web server port (default: `8765`).

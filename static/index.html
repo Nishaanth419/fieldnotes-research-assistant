@@ -261,6 +261,24 @@
       document.querySelector("#progress-badge").textContent = "IN PROGRESS";
     }
 
+    function showReview(event) {
+      setBusy(false);
+      document.querySelector("#progress-title").textContent = "Review the research";
+      document.querySelector("#progress-badge").textContent = `QUALITY ${event.quality_score}/5`;
+      document.querySelector("#review-feedback").textContent =
+        `Critic's note: ${event.critic_feedback || "Review the gathered sources before synthesis."}`;
+      if (event.subtasks) {
+        subtasks.replaceChildren(...event.subtasks.map((task) => {
+          const item = document.createElement("li");
+          item.textContent = task;
+          return item;
+        }));
+      }
+      findings.value = JSON.stringify(event.findings, null, 2);
+      reviewPanel.hidden = false;
+      approveButton.disabled = false;
+    }
+
     function connectEvents() {
       eventSource?.close();
       eventSource = new EventSource(`/api/events/${encodeURIComponent(threadId)}?after=${eventCursor}`);
@@ -271,21 +289,7 @@
           addAgentEvent(event.node, event.update);
         } else if (event.type === "review") {
           eventSource.close();
-          setBusy(false);
-          document.querySelector("#progress-title").textContent = "Review the research";
-          document.querySelector("#progress-badge").textContent = `QUALITY ${event.quality_score}/5`;
-          document.querySelector("#review-feedback").textContent =
-            `Critic's note: ${event.critic_feedback || "Review the gathered sources before synthesis."}`;
-          if (event.subtasks) {
-            subtasks.replaceChildren(...event.subtasks.map((task) => {
-              const item = document.createElement("li");
-              item.textContent = task;
-              return item;
-            }));
-          }
-          findings.value = JSON.stringify(event.findings, null, 2);
-          reviewPanel.hidden = false;
-          approveButton.disabled = false;
+          showReview(event);
         } else if (event.type === "complete") {
           eventSource.close();
           setBusy(false);
@@ -369,6 +373,37 @@
       reportElement.classList.add("show");
     }
 
+    async function restorePreviousRun() {
+      const savedThreadId = localStorage.getItem("fieldnotes.thread_id");
+      if (!savedThreadId) return;
+
+      try {
+        const response = await fetch(`/api/research/${encodeURIComponent(savedThreadId)}`);
+        if (!response.ok) {
+          if (response.status === 404) localStorage.removeItem("fieldnotes.thread_id");
+          return;
+        }
+        const savedRun = await response.json();
+        threadId = savedThreadId;
+        eventCursor = savedRun.cursor || 0;
+        progress.classList.add("show");
+        if (savedRun.status === "waiting_review") {
+          showReview(savedRun);
+        } else if (savedRun.status === "complete") {
+          document.querySelector("#progress-title").textContent = "Research report";
+          document.querySelector("#progress-badge").textContent = "COMPLETE";
+          renderReport(savedRun.report);
+        } else if (savedRun.status === "running") {
+          setBusy(true, "Research in progress");
+          connectEvents();
+        } else {
+          showError(savedRun.message || "This run was interrupted. Start a new research run.");
+        }
+      } catch {
+        showError("Could not restore the saved research run.");
+      }
+    }
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       errorElement.classList.remove("show");
@@ -388,6 +423,7 @@
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "Could not start research.");
         threadId = payload.thread_id;
+        localStorage.setItem("fieldnotes.thread_id", threadId);
         progress.classList.add("show");
         setBusy(true, "Research in progress");
         connectEvents();
@@ -395,6 +431,8 @@
         showError(error.message);
       }
     });
+
+    restorePreviousRun();
 
     approveButton.addEventListener("click", async () => {
       errorElement.classList.remove("show");
