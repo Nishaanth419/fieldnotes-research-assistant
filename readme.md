@@ -59,6 +59,8 @@ The app binds to `127.0.0.1` by default. Ollama must be running locally with the
 If Ollama is not running, start it in another terminal with `ollama serve`.
 Graph checkpoints are saved by default at `data/research_checkpoints.sqlite`. Set `CHECKPOINT_DB_PATH` in `.env` to choose another location. The browser remembers the latest run ID so a paused review or completed report can be restored after restarting the app in the same browser. Keep the database private because it contains research questions and collected findings; it is excluded by `.gitignore`.
 
+The header service checks confirm the configured Ollama model is installed and make a one-result Tavily search to check API access. If a model/API request fails, the app displays a provider-specific action. Runs interrupted during an agent step can be resumed from their last SQLite checkpoint using **Resume saved research**. Tavily health checks make a small search request and may use one search credit.
+
 ## Run the terminal interface
 
 ```bash

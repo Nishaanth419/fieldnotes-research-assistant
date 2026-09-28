@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
-import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,9 +14,14 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from dotenv import load_dotenv
+from ollama import Client as OllamaClient
+from ollama import ResponseError as OllamaResponseError
+from tavily import TavilyClient
+from tavily.errors import InvalidAPIKeyError, UsageLimitExceededError
 
 from main import _validated_findings
 from state import AgentState
+from tools.search import DEFAULT_CLIMATE_DOMAINS
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -27,6 +32,205 @@ _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _graph: Any = None
 _graph_lock = threading.Lock()
+
+
+def _ollama_model_name() -> str:
+    """Read the model setting after dotenv has been loaded."""
+    return os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+
+def _ollama_base_url() -> str:
+    """Read the local Ollama endpoint after dotenv has been loaded."""
+    return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+
+
+def _provider_error(provider: str, exc: Exception) -> dict[str, Any]:
+    """Map provider exceptions to safe, actionable messages without exposing secrets."""
+    status_code = getattr(exc, "status_code", None)
+    error_text = str(exc).lower()
+
+    if provider == "ollama":
+        if isinstance(exc, OllamaResponseError) and (
+            status_code == 404 or "not found" in error_text
+        ):
+            return {
+                "provider": provider,
+                "code": "ollama_model_missing",
+                "message": f"The local Ollama model '{_ollama_model_name()}' is not installed.",
+                "action": f"Run `ollama pull {_ollama_model_name()}` and retry.",
+                "retryable": True,
+            }
+        if (
+            isinstance(exc, (ConnectionError, TimeoutError))
+            or type(exc).__name__ in {"ConnectError", "ConnectTimeout", "TimeoutException"}
+            or "connect" in error_text
+        ):
+            return {
+                "provider": provider,
+                "code": "ollama_unavailable",
+                "message": "The local Ollama server could not be reached.",
+                "action": "Start Ollama with `ollama serve`, then resume the run.",
+                "retryable": True,
+            }
+        return {
+            "provider": provider,
+            "code": "ollama_request_failed",
+            "message": "The local model could not complete this step.",
+            "action": "Check that the Ollama model is available, then retry the run.",
+            "retryable": True,
+        }
+
+    if isinstance(exc, InvalidAPIKeyError) or status_code in (401, 403):
+        return {
+            "provider": "tavily",
+            "code": "tavily_auth_failed",
+            "message": "Tavily rejected the configured API key.",
+            "action": "Update TAVILY_API_KEY in .env, restart the app, and resume.",
+            "retryable": True,
+        }
+    if isinstance(exc, UsageLimitExceededError) or status_code == 429:
+        return {
+            "provider": "tavily",
+            "code": "tavily_limit_reached",
+            "message": "The Tavily request limit has been reached.",
+            "action": "Check your Tavily plan or retry after the quota resets.",
+            "retryable": True,
+        }
+    if (
+        isinstance(exc, (ConnectionError, TimeoutError))
+        or type(exc).__name__ in {"ConnectError", "ConnectTimeout", "TimeoutException"}
+        or "connect" in error_text
+    ):
+        return {
+            "provider": "tavily",
+            "code": "tavily_unavailable",
+            "message": "Tavily could not be reached to run the web search.",
+            "action": "Check your network connection, then resume the run.",
+            "retryable": True,
+        }
+    return {
+        "provider": "tavily",
+        "code": "tavily_search_failed",
+        "message": "Tavily could not complete the web search.",
+        "action": "Check Tavily service status and your search configuration, then retry.",
+        "retryable": True,
+    }
+
+
+def _check_ollama_health() -> dict[str, Any]:
+    """Verify Ollama is reachable and the configured local model is installed."""
+    model_name = _ollama_model_name()
+    try:
+        response = OllamaClient(host=_ollama_base_url(), timeout=3).list()
+        installed_models = {model.model for model in response.models}
+        if model_name not in installed_models:
+            return {
+                "status": "error",
+                "model": model_name,
+                "error": {
+                    "provider": "ollama",
+                    "code": "ollama_model_missing",
+                    "message": f"The local Ollama model '{model_name}' is not installed.",
+                    "action": f"Run `ollama pull {model_name}`.",
+                },
+            }
+        return {"status": "ok", "model": model_name}
+    except Exception as exc:
+        return {"status": "error", "model": model_name, "error": _provider_error("ollama", exc)}
+
+
+def _check_tavily_health() -> dict[str, Any]:
+    """Validate Tavily credentials and search availability with a minimal request."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return {
+            "status": "error",
+            "error": {
+                "provider": "tavily",
+                "code": "tavily_key_missing",
+                "message": "TAVILY_API_KEY is not configured.",
+                "action": "Add a valid Tavily key to .env, then restart the app.",
+            },
+        }
+    try:
+        TavilyClient(api_key=api_key).search(
+            query="urban heat health",
+            search_depth="basic",
+            max_results=1,
+            include_domains=list(DEFAULT_CLIMATE_DOMAINS),
+            include_domains_mode="restrict",
+            include_answer=False,
+            timeout=5,
+        )
+        return {"status": "ok"}
+    except Exception as exc:
+        return {"status": "error", "error": _provider_error("tavily", exc)}
+
+
+def _resume_checkpointed_run(thread_id: str) -> tuple[HTTPStatus, dict[str, Any]]:
+    """Validate a persisted interrupted run and relaunch its unfinished graph step."""
+    try:
+        job = _restore_job(thread_id)
+    except Exception as exc:
+        print(f"Could not restore research run ({type(exc).__name__}).", file=sys.stderr)
+        return (
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            {
+                "error": {
+                    "code": "checkpoint_read_failed",
+                    "message": "The saved research checkpoint could not be opened.",
+                    "action": "Check the SQLite database path and file permissions.",
+                }
+            },
+        )
+    if job is None:
+        return HTTPStatus.NOT_FOUND, {"error": "Research run not found."}
+
+    with _jobs_lock:
+        if job["status"] not in {"interrupted", "error"}:
+            return (
+                HTTPStatus.CONFLICT,
+                {"error": "This research run is not interrupted or failed."},
+            )
+        previous_status = job["status"]
+        job["status"] = "resuming"
+
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        snapshot = _get_graph().get_state(config)
+    except Exception as exc:
+        with _jobs_lock:
+            job["status"] = previous_status
+        print(f"Could not load research checkpoint ({type(exc).__name__}).", file=sys.stderr)
+        return (
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            {
+                "error": {
+                    "code": "checkpoint_read_failed",
+                    "message": "The saved research checkpoint could not be opened.",
+                    "action": "Check the SQLite database path and file permissions.",
+                }
+            },
+        )
+    if not snapshot.values or not snapshot.next:
+        with _jobs_lock:
+            job["status"] = previous_status
+        return (
+            HTTPStatus.CONFLICT,
+            {
+                "error": {
+                    "code": "checkpoint_not_resumable",
+                    "message": "No unfinished graph step is available to resume.",
+                    "action": "Start a new research run.",
+                }
+            },
+        )
+
+    with _jobs_lock:
+        job["status"] = "running"
+        job["events"].clear()
+    _launch_resume_worker(thread_id)
+    return HTTPStatus.ACCEPTED, {"status": "resuming"}
 
 
 def _get_graph() -> Any:
@@ -72,8 +276,10 @@ def _restore_job(thread_id: str) -> dict[str, Any] | None:
             "type": "error",
             "message": (
                 "This run was interrupted while an agent was working. "
-                "Its checkpoint is preserved; start a new run to continue research."
+                "Its last checkpoint is preserved and can be resumed."
             ),
+            "action": "Resume the run to retry the unfinished agent step.",
+            "resumable": bool(snapshot.next),
         }
 
     restored_job = {
@@ -93,13 +299,27 @@ def _append_event(thread_id: str, event_type: str, **data: Any) -> None:
         job["condition"].notify_all()
 
 
+def _launch_resume_worker(thread_id: str) -> None:
+    """Start the worker that continues a graph from the current checkpoint."""
+    threading.Thread(
+        target=_run_graph,
+        args=(thread_id, None),
+        daemon=True,
+    ).start()
+
+
 def _run_graph(thread_id: str, input_state: AgentState | None) -> None:
     """Run or resume a graph in a worker thread and publish each node's update."""
-    graph = _get_graph()
     config = {"configurable": {"thread_id": thread_id}}
+    graph: Any = None
+    current_node = "workflow"
     try:
+        graph = _get_graph()
+        current_node = "planner" if input_state is not None else "research"
         for update in graph.stream(input_state, config, stream_mode="updates"):
             for node, node_update in update.items():
+                if node != "__interrupt__":
+                    current_node = node
                 _append_event(
                     thread_id,
                     "node",
@@ -129,9 +349,48 @@ def _run_graph(thread_id: str, input_state: AgentState | None) -> None:
                 report=snapshot.values["final_report"],
             )
     except Exception as exc:
+        if graph is None:
+            resumable = False
+            provider_error = {
+                "provider": "workflow",
+                "code": "checkpoint_store_unavailable",
+                "message": "The research workflow could not open its checkpoint store.",
+                "action": "Check CHECKPOINT_DB_PATH and database file permissions, then restart the app.",
+                "retryable": False,
+            }
+        else:
+            try:
+                snapshot = graph.get_state(config)
+                resumable = bool(snapshot.values and snapshot.next)
+                failed_node = snapshot.next[0] if snapshot.next else current_node
+            except Exception as checkpoint_error:
+                print(
+                    "Could not inspect failed run checkpoint "
+                    f"({type(checkpoint_error).__name__}).",
+                    file=sys.stderr,
+                )
+                resumable = False
+                failed_node = current_node
+            if failed_node == "researcher":
+                provider_error = _provider_error("tavily", exc)
+            elif failed_node in {"planner", "critic", "synthesizer"}:
+                provider_error = _provider_error("ollama", exc)
+            else:
+                provider_error = {
+                    "provider": "workflow",
+                    "code": "workflow_step_failed",
+                    "message": "The research workflow could not complete this step.",
+                    "action": "Inspect application logs; resume from the saved checkpoint if possible.",
+                    "retryable": True,
+                }
         with _jobs_lock:
             _jobs[thread_id]["status"] = "error"
-        _append_event(thread_id, "error", message=str(exc))
+        _append_event(
+            thread_id,
+            "error",
+            **provider_error,
+            resumable=resumable,
+        )
 
 
 class ResearchRequestHandler(BaseHTTPRequestHandler):
@@ -177,7 +436,16 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/api/events/"):
             self._stream_events(parsed.path.removeprefix("/api/events/"), parsed.query)
         elif parsed.path == "/api/health":
-            self._send_json(HTTPStatus.OK, {"status": "ok"})
+            providers = {
+                "ollama": _check_ollama_health(),
+                "tavily": _check_tavily_health(),
+            }
+            status = (
+                "ok"
+                if all(provider["status"] == "ok" for provider in providers.values())
+                else "degraded"
+            )
+            self._send_json(HTTPStatus.OK, {"status": status, "providers": providers})
         elif parsed.path.startswith("/api/research/"):
             thread_id = parsed.path.removeprefix("/api/research/").strip("/")
             self._get_research_status(thread_id)
@@ -193,6 +461,10 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/research/") and parsed.path.endswith("/review"):
             thread_id = parsed.path.removeprefix("/api/research/").removesuffix("/review").strip("/")
             self._submit_review(thread_id)
+            return
+        if parsed.path.startswith("/api/research/") and parsed.path.endswith("/resume"):
+            thread_id = parsed.path.removeprefix("/api/research/").removesuffix("/resume").strip("/")
+            self._resume_research(thread_id)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
@@ -213,16 +485,18 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
             question = request.get("question")
             if not isinstance(question, str) or not question.strip():
                 raise ValueError("Enter a research question to continue.")
-            missing_keys = [
-                key
-                for key in ("TAVILY_API_KEY",)
-                if not os.getenv(key)
-            ]
-            if missing_keys:
-                raise ValueError(
-                    "Add the required key(s) to .env before researching: "
-                    + ", ".join(missing_keys)
+            if not os.getenv("TAVILY_API_KEY"):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": {
+                            "code": "tavily_key_missing",
+                            "message": "TAVILY_API_KEY is not configured.",
+                            "action": "Add a valid Tavily key to .env, then restart the app.",
+                        }
+                    },
                 )
+                return
 
             thread_id = str(uuid4())
             condition = threading.Condition(_jobs_lock)
@@ -252,7 +526,15 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
             ).start()
             self._send_json(HTTPStatus.ACCEPTED, {"thread_id": thread_id})
         except ValueError as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": {
+                        "code": "invalid_research_request",
+                        "message": str(exc),
+                    }
+                },
+            )
 
     def _submit_review(self, thread_id: str) -> None:
         """Validate reviewed findings, update the paused checkpoint, and resume."""
@@ -296,11 +578,25 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
 
     def _get_research_status(self, thread_id: str) -> None:
         """Return persisted review or completion data so clients can recover after restart."""
-        job = _restore_job(thread_id)
+        try:
+            job = _restore_job(thread_id)
+        except Exception as exc:
+            print(f"Could not restore research status ({type(exc).__name__}).", file=sys.stderr)
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": {
+                        "code": "checkpoint_read_failed",
+                        "message": "The saved research run could not be read.",
+                        "action": "Check the SQLite database path and file permissions.",
+                    }
+                },
+            )
+            return
         if job is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
             return
-        latest_event = job["events"][-1]
+        latest_event = job["events"][-1] if job["events"] else {}
         self._send_json(
             HTTPStatus.OK,
             {
@@ -313,6 +609,11 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
                 },
             },
         )
+
+    def _resume_research(self, thread_id: str) -> None:
+        """Retry the unfinished graph step from its most recent SQLite checkpoint."""
+        status, response = _resume_checkpointed_run(thread_id)
+        self._send_json(status, response)
 
     def _stream_events(self, thread_id: str, query: str) -> None:
         """Stream ordered workflow events until review, completion, or failure."""
