@@ -41,6 +41,50 @@ def _get_graph() -> Any:
     return _graph
 
 
+def _restore_job(thread_id: str) -> dict[str, Any] | None:
+    """Rebuild an in-memory event view from a persisted graph checkpoint."""
+    with _jobs_lock:
+        existing_job = _jobs.get(thread_id)
+        if existing_job is not None:
+            return existing_job
+
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = _get_graph().get_state(config)
+    if not snapshot.values:
+        return None
+
+    if "human_in_the_loop" in snapshot.next:
+        status = "waiting_review"
+        event = {
+            "type": "review",
+            "findings": snapshot.values["findings"],
+            "subtasks": snapshot.values["subtasks"],
+            "quality_score": snapshot.values["quality_score"],
+            "task_reviews": snapshot.values["task_reviews"],
+            "critic_feedback": snapshot.values["critic_feedback"],
+        }
+    elif not snapshot.next and snapshot.values.get("final_report"):
+        status = "complete"
+        event = {"type": "complete", "report": snapshot.values["final_report"]}
+    else:
+        status = "interrupted"
+        event = {
+            "type": "error",
+            "message": (
+                "This run was interrupted while an agent was working. "
+                "Its checkpoint is preserved; start a new run to continue research."
+            ),
+        }
+
+    restored_job = {
+        "status": status,
+        "events": [event],
+        "condition": threading.Condition(_jobs_lock),
+    }
+    with _jobs_lock:
+        return _jobs.setdefault(thread_id, restored_job)
+
+
 def _append_event(thread_id: str, event_type: str, **data: Any) -> None:
     """Publish an ordered event for the browser to read through Server-Sent Events."""
     with _jobs_lock:
@@ -134,6 +178,9 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
             self._stream_events(parsed.path.removeprefix("/api/events/"), parsed.query)
         elif parsed.path == "/api/health":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
+        elif parsed.path.startswith("/api/research/"):
+            thread_id = parsed.path.removeprefix("/api/research/").strip("/")
+            self._get_research_status(thread_id)
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
@@ -216,11 +263,11 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
+        job = _restore_job(thread_id)
+        if job is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
+            return
         with _jobs_lock:
-            job = _jobs.get(thread_id)
-            if job is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
-                return
             if job["status"] != "waiting_review":
                 self._send_json(
                     HTTPStatus.CONFLICT,
@@ -247,13 +294,33 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
         ).start()
         self._send_json(HTTPStatus.ACCEPTED, {"status": "resuming"})
 
+    def _get_research_status(self, thread_id: str) -> None:
+        """Return persisted review or completion data so clients can recover after restart."""
+        job = _restore_job(thread_id)
+        if job is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
+            return
+        latest_event = job["events"][-1]
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": job["status"],
+                "cursor": len(job["events"]),
+                **{
+                    key: value
+                    for key, value in latest_event.items()
+                    if key != "type"
+                },
+            },
+        )
+
     def _stream_events(self, thread_id: str, query: str) -> None:
         """Stream ordered workflow events until review, completion, or failure."""
+        job = _restore_job(thread_id)
+        if job is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
+            return
         with _jobs_lock:
-            job = _jobs.get(thread_id)
-            if job is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Research run not found."})
-                return
             try:
                 after = int(parse_qs(query).get("after", ["0"])[0])
             except ValueError:
