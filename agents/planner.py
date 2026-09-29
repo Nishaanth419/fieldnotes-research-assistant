@@ -15,7 +15,7 @@ class ResearchPlan(BaseModel):
 
 
 def planner_agent(state: AgentState) -> dict[str, list[str]]:
-    """Ask the local model to create focused urban climate research sub-tasks."""
+    """Ask the OpenAI model to create focused urban climate research sub-tasks."""
     planner = get_chat_model().with_structured_output(ResearchPlan)
     system_prompt = (
         "Plan urban heat and climate adaptation research. Create 3 to 5 short, "

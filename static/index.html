@@ -159,7 +159,7 @@
         <div class="brand-mark" aria-hidden="true">f</div>
         <div class="brand-name">fieldnotes<span class="brand-tag">/ research assistant</span></div>
       </div>
-      <div class="local-status"><span class="status-dot"></span> Private local workspace</div>
+      <div class="local-status"><span class="status-dot"></span> Local app · OpenAI + Tavily APIs</div>
     </header>
     <main>
       <section class="intro">
@@ -169,7 +169,7 @@
       </section>
       <div class="provider-health" id="provider-health" aria-live="polite">
         <strong>Service checks</strong>
-        <span class="provider-indicator" id="ollama-health">Ollama: checking</span>
+        <span class="provider-indicator" id="openai-health">OpenAI: checking</span>
         <span class="provider-indicator" id="tavily-health">Tavily: checking</span>
         <button type="button" class="health-refresh" id="refresh-health">Refresh checks</button>
       </div>
@@ -178,7 +178,7 @@
         <section class="panel main-panel">
           <div class="panel-top">
             <div class="panel-title">Explore a city climate question</div>
-            <div class="panel-kicker">LOCAL OLLAMA · TRUSTED CLIMATE SOURCES</div>
+            <div class="panel-kicker">OPENAI · TRUSTED CLIMATE SOURCES</div>
           </div>
           <form id="research-form" class="form-area">
             <label for="question">What would you like to understand about urban heat?</label>
@@ -274,30 +274,30 @@
     }
 
     async function refreshHealth() {
-      const ollamaIndicator = document.querySelector("#ollama-health");
+      const openaiIndicator = document.querySelector("#openai-health");
       const tavilyIndicator = document.querySelector("#tavily-health");
-      ollamaIndicator.dataset.status = "";
+      openaiIndicator.dataset.status = "";
       tavilyIndicator.dataset.status = "";
-      ollamaIndicator.textContent = "Ollama: checking";
+      openaiIndicator.textContent = "OpenAI: checking";
       tavilyIndicator.textContent = "Tavily: checking";
       try {
         const response = await fetch("/api/health");
         const health = await response.json();
         for (const [provider, indicator] of [
-          ["ollama", ollamaIndicator],
+          ["openai", openaiIndicator],
           ["tavily", tavilyIndicator],
         ]) {
           const result = health.providers?.[provider];
           indicator.dataset.status = result?.status === "ok" ? "ok" : "error";
           indicator.textContent = result?.status === "ok"
-            ? `${provider === "ollama" ? "Ollama" : "Tavily"}: ready`
-            : `${provider === "ollama" ? "Ollama" : "Tavily"}: ${result?.error?.message || "unavailable"}`;
+            ? `${provider === "openai" ? "OpenAI" : "Tavily"}: ready`
+            : `${provider === "openai" ? "OpenAI" : "Tavily"}: ${result?.error?.message || "unavailable"}`;
           indicator.title = result?.error?.action || "";
         }
       } catch {
-        ollamaIndicator.dataset.status = "error";
+        openaiIndicator.dataset.status = "error";
         tavilyIndicator.dataset.status = "error";
-        ollamaIndicator.textContent = "Ollama: health check unavailable";
+        openaiIndicator.textContent = "OpenAI: health check unavailable";
         tavilyIndicator.textContent = "Tavily: health check unavailable";
       }
     }

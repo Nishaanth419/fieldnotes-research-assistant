@@ -11,7 +11,7 @@ import pytest
 from graph import workflow
 from state import AgentState
 from webapp import (
-    _check_ollama_health,
+    _check_openai_health,
     _check_tavily_health,
     _jobs,
     _provider_error,
@@ -40,8 +40,8 @@ def test_health_endpoint_reports_both_provider_states(
     monkeypatch: Any,
     local_app_server: str,
 ) -> None:
-    """Expose Ollama and Tavily readiness together through the health API."""
-    monkeypatch.setattr(webapp, "_check_ollama_health", lambda: {"status": "ok"})
+    """Expose OpenAI and Tavily readiness together through the health API."""
+    monkeypatch.setattr(webapp, "_check_openai_health", lambda: {"status": "ok"})
     monkeypatch.setattr(
         webapp,
         "_check_tavily_health",
@@ -55,7 +55,7 @@ def test_health_endpoint_reports_both_provider_states(
         health = json.load(response)
 
     assert health["status"] == "degraded"
-    assert health["providers"]["ollama"]["status"] == "ok"
+    assert health["providers"]["openai"]["status"] == "ok"
     assert health["providers"]["tavily"]["error"]["code"] == "tavily_limit_reached"
 
 
@@ -84,48 +84,33 @@ def test_resume_endpoint_routes_to_saved_checkpoint(
     assert body == {"status": "resuming"}
 
 
-def test_ollama_health_reports_ready_model(monkeypatch: Any) -> None:
-    """Report the configured model only when it is present in the local service."""
-    class FakeModel:
-        model = "llama3.1:8b"
+def test_openai_health_requires_key_without_calling_provider(monkeypatch: Any) -> None:
+    """Report missing OpenAI configuration without making a network request."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class FakeResponse:
-        models = [FakeModel()]
-
-    class FakeOllamaClient:
-        def __init__(self, **kwargs: Any) -> None:
-            assert kwargs["host"] == "http://ollama.test"
-
-        def list(self) -> FakeResponse:
-            return FakeResponse()
-
-    monkeypatch.setenv("OLLAMA_MODEL", "llama3.1:8b")
-    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test")
-    monkeypatch.setattr(webapp, "OllamaClient", FakeOllamaClient)
-
-    assert _check_ollama_health() == {"status": "ok", "model": "llama3.1:8b"}
-
-
-def test_ollama_health_gives_pull_command_for_missing_model(monkeypatch: Any) -> None:
-    """Tell users how to install the configured model when Ollama is reachable."""
-    class FakeResponse:
-        models: list[object] = []
-
-    class FakeOllamaClient:
-        def __init__(self, **kwargs: Any) -> None:
-            pass
-
-        def list(self) -> FakeResponse:
-            return FakeResponse()
-
-    monkeypatch.setenv("OLLAMA_MODEL", "missing-model")
-    monkeypatch.setattr(webapp, "OllamaClient", FakeOllamaClient)
-
-    result = _check_ollama_health()
+    result = _check_openai_health()
 
     assert result["status"] == "error"
-    assert result["error"]["code"] == "ollama_model_missing"
-    assert "ollama pull missing-model" in result["error"]["action"]
+    assert result["error"]["code"] == "openai_key_missing"
+
+
+def test_openai_health_reports_ready_model(monkeypatch: Any) -> None:
+    """Report the configured model when the OpenAI API recognizes it."""
+    class FakeModels:
+        def retrieve(self, model: str) -> None:
+            assert model == "gpt-4o-mini"
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key: str, timeout: int) -> None:
+            assert api_key == "test-openai-key"
+            assert timeout == 3
+            self.models = FakeModels()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(webapp, "OpenAI", FakeOpenAIClient)
+
+    assert _check_openai_health() == {"status": "ok", "model": "gpt-4o-mini"}
 
 
 def test_tavily_health_requires_key_without_calling_provider(monkeypatch: Any) -> None:
@@ -167,17 +152,37 @@ def test_tavily_health_checks_search_access_and_sanitizes_auth_error(
 
 
 def test_provider_failures_include_actionable_recovery_steps() -> None:
-    """Classify common Ollama and Tavily failures into safe next steps."""
-    ollama_error = _provider_error("ollama", ConnectionError("connection refused"))
+    """Classify common OpenAI and Tavily failures into safe next steps."""
+    openai_error = _provider_error("openai", ConnectionError("connection refused"))
     tavily_error = _provider_error(
         "tavily",
         type("RateLimitError", (Exception,), {"status_code": 429})("rate limited"),
     )
 
-    assert ollama_error["code"] == "ollama_unavailable"
-    assert "ollama serve" in ollama_error["action"]
+    assert openai_error["code"] == "openai_unavailable"
+    assert "network" in openai_error["action"].lower()
     assert tavily_error["code"] == "tavily_limit_reached"
     assert "quota" in tavily_error["action"].lower()
+
+
+def test_openai_provider_errors_identify_authentication_and_model_failures(
+    monkeypatch: Any,
+) -> None:
+    """Give actionable recovery steps for invalid credentials and unavailable models."""
+    monkeypatch.setenv("OPENAI_MODEL", "missing-model")
+    auth_error = _provider_error(
+        "openai",
+        type("UnauthorizedError", (Exception,), {"status_code": 401})("unauthorized"),
+    )
+    model_error = _provider_error(
+        "openai",
+        type("NotFoundError", (Exception,), {"status_code": 404})("not found"),
+    )
+
+    assert auth_error["code"] == "openai_auth_failed"
+    assert "OPENAI_API_KEY" in auth_error["action"]
+    assert model_error["code"] == "openai_model_unavailable"
+    assert "missing-model" in model_error["message"]
 
 
 def test_checkpoint_store_failure_is_reported_as_a_worker_error(
@@ -223,7 +228,7 @@ def test_interrupted_graph_run_can_be_restored_and_resumed(
     }
 
     def failing_planner(_: AgentState) -> dict[str, list[str]]:
-        raise ConnectionError("Ollama is unavailable")
+        raise ConnectionError("OpenAI is unavailable")
 
     monkeypatch.setattr(workflow, "planner_agent", failing_planner)
     graph = workflow.build_research_graph(
@@ -240,7 +245,7 @@ def test_interrupted_graph_run_can_be_restored_and_resumed(
 
     failed_job = _jobs[run_id]
     assert failed_job["status"] == "error"
-    assert failed_job["events"][-1]["code"] == "ollama_unavailable"
+    assert failed_job["events"][-1]["code"] == "openai_unavailable"
     assert failed_job["events"][-1]["resumable"] is True
     graph.checkpointer.conn.close()
 
