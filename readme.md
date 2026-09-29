@@ -1,6 +1,6 @@
 # Urban Heat & Climate Resilience Research Assistant
 
-A local, multi-agent research assistant focused on urban heat resilience and climate adaptation. Ask about heat risk, public-health impacts, neighborhood vulnerability, or city adaptation strategies. The workflow plans focused investigations, searches a curated set of trusted sources, reviews evidence quality, pauses for your review, and then writes a structured report with source links.
+A multi-agent research assistant focused on urban heat resilience and climate adaptation. Ask about heat risk, public-health impacts, neighborhood vulnerability, or city adaptation strategies. The workflow plans focused investigations with OpenAI, searches a curated set of trusted sources, reviews evidence quality, pauses for your review, and then writes a structured report with source links.
 
 ## What it does
 
@@ -20,8 +20,8 @@ Set `TAVILY_INCLUDE_DOMAINS` to a comma-separated list to replace the defaults. 
 ## Requirements
 
 - Python 3.11 or newer
+- An OpenAI API key
 - A Tavily API key
-- [Ollama](https://ollama.com/) with the `llama3.1:8b` model installed
 
 ## Setup
 
@@ -31,16 +31,15 @@ From this directory:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-ollama pull llama3.1:8b
 ```
 
-Copy the safe example file, then add your Tavily key to `.env`:
+Copy the safe example file, then add your OpenAI and Tavily keys to `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-The language model runs locally through Ollama. Tavily requires an API key for web searches. `.env` is excluded by `.gitignore` and must not be committed.
+The language model uses the OpenAI API with `gpt-4o-mini` by default. OpenAI and Tavily require API keys. `.env` is excluded by `.gitignore` and must not be committed.
 
 ## Run the web app
 
@@ -54,12 +53,10 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765). If port 8765 is unavailable
 RESEARCH_PORT=8766 .venv/bin/python webapp.py
 ```
 
-The app binds to `127.0.0.1` by default. Ollama must be running locally with the selected model; a research run also requires a valid Tavily key.
-
-If Ollama is not running, start it in another terminal with `ollama serve`.
+The app binds to `127.0.0.1` by default. A research run requires valid OpenAI and Tavily API keys.
 Graph checkpoints are saved by default at `data/research_checkpoints.sqlite`. Set `CHECKPOINT_DB_PATH` in `.env` to choose another location. The browser remembers the latest run ID so a paused review or completed report can be restored after restarting the app in the same browser. Keep the database private because it contains research questions and collected findings; it is excluded by `.gitignore`.
 
-The header service checks confirm the configured Ollama model is installed and make a one-result Tavily search to check API access. If a model/API request fails, the app displays a provider-specific action. Runs interrupted during an agent step can be resumed from their last SQLite checkpoint using **Resume saved research**. Tavily health checks make a small search request and may use one search credit.
+The header service checks confirm the configured OpenAI model is available to your project and make a one-result Tavily search to check API access. If a model/API request fails, the app displays a provider-specific action. Runs interrupted during an agent step can be resumed from their last SQLite checkpoint using **Resume saved research**. Tavily health checks make a small search request and may use one search credit.
 
 ## Run the terminal interface
 
@@ -76,18 +73,18 @@ Install development dependencies and run the deterministic test suite:
 .venv/bin/python -m pytest
 ```
 
-The Ollama schema-binding test runs without making a model request. To also test actual local inference, ensure Ollama is running and the configured model is installed, then run:
+The OpenAI schema-binding test runs without making a model request. To also test actual inference (which uses the OpenAI API), configure a valid key and run:
 
 ```bash
-RUN_LOCAL_MODEL_TESTS=1 .venv/bin/python -m pytest -m ollama
+RUN_OPENAI_MODEL_TESTS=1 .venv/bin/python -m pytest -m openai
 ```
 
 ## Review and configuration
 
 Before the report is written, the workflow pauses. In the web app, inspect or edit the findings JSON and choose **Approve & write report** to resume synthesis.
 
-- `OLLAMA_MODEL`: local Ollama model (default: `llama3.1:8b`).
-- `OLLAMA_BASE_URL`: local Ollama server URL (default: `http://127.0.0.1:11434`).
+- `OPENAI_API_KEY`: required OpenAI API key.
+- `OPENAI_MODEL`: OpenAI model (default: `gpt-4o-mini`).
 - `CHECKPOINT_DB_PATH`: SQLite workflow checkpoint file (default: `data/research_checkpoints.sqlite`).
 - `TAVILY_INCLUDE_DOMAINS`: optional comma-separated allowlist replacing the built-in urban climate sources.
 - `RESEARCH_PORT`: optional local web server port (default: `8765`).

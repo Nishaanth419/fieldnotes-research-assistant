@@ -55,7 +55,9 @@ def _review_findings(graph: Any, config: dict[str, Any]) -> None:
 def main() -> None:
     """Load credentials, stream graph progress, pause for review, and print the report."""
     load_dotenv()
-    missing_keys = [key for key in ("TAVILY_API_KEY",) if not os.getenv(key)]
+    missing_keys = [
+        key for key in ("OPENAI_API_KEY", "TAVILY_API_KEY") if not os.getenv(key)
+    ]
     if missing_keys:
         raise SystemExit(
             "Missing required API key(s): "

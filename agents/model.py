@@ -1,19 +1,16 @@
-"""Configure the shared local Ollama chat model used by all research agents."""
+"""Configure the shared OpenAI chat model used by all research agents."""
 
 import os
 
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
 
-DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
-def get_chat_model() -> ChatOllama:
-    """Create a local Ollama model with enough context for bounded research evidence."""
-    return ChatOllama(
-        model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
-        base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
+def get_chat_model() -> ChatOpenAI:
+    """Create an OpenAI model for bounded research evidence."""
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         temperature=0,
-        num_ctx=16_384,
     )

@@ -14,8 +14,13 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from ollama import Client as OllamaClient
-from ollama import ResponseError as OllamaResponseError
+from openai import (
+    APIConnectionError,
+    AuthenticationError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from tavily import TavilyClient
 from tavily.errors import InvalidAPIKeyError, UsageLimitExceededError
 
@@ -34,14 +39,9 @@ _graph: Any = None
 _graph_lock = threading.Lock()
 
 
-def _ollama_model_name() -> str:
+def _openai_model_name() -> str:
     """Read the model setting after dotenv has been loaded."""
-    return os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-
-
-def _ollama_base_url() -> str:
-    """Read the local Ollama endpoint after dotenv has been loaded."""
-    return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def _provider_error(provider: str, exc: Exception) -> dict[str, Any]:
@@ -49,34 +49,51 @@ def _provider_error(provider: str, exc: Exception) -> dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
     error_text = str(exc).lower()
 
-    if provider == "ollama":
-        if isinstance(exc, OllamaResponseError) and (
-            status_code == 404 or "not found" in error_text
+    if provider == "openai":
+        if status_code == 404 or "not found" in error_text:
+            return {
+                "provider": provider,
+                "code": "openai_model_unavailable",
+                "message": f"The OpenAI model '{_openai_model_name()}' is unavailable.",
+                "action": "Check OPENAI_MODEL and confirm the model is available to your OpenAI project.",
+                "retryable": True,
+            }
+        if isinstance(exc, (AuthenticationError, PermissionDeniedError)) or status_code in (
+            401,
+            403,
         ):
             return {
                 "provider": provider,
-                "code": "ollama_model_missing",
-                "message": f"The local Ollama model '{_ollama_model_name()}' is not installed.",
-                "action": f"Run `ollama pull {_ollama_model_name()}` and retry.",
+                "code": "openai_auth_failed",
+                "message": "OpenAI rejected the configured API key or project access.",
+                "action": "Check OPENAI_API_KEY and your OpenAI project permissions, then restart the app.",
+                "retryable": True,
+            }
+        if isinstance(exc, RateLimitError) or status_code == 429:
+            return {
+                "provider": provider,
+                "code": "openai_rate_limited",
+                "message": "The OpenAI request limit or quota has been reached.",
+                "action": "Check your OpenAI project limits or retry after the limit resets.",
                 "retryable": True,
             }
         if (
-            isinstance(exc, (ConnectionError, TimeoutError))
+            isinstance(exc, (APIConnectionError, ConnectionError, TimeoutError))
             or type(exc).__name__ in {"ConnectError", "ConnectTimeout", "TimeoutException"}
             or "connect" in error_text
         ):
             return {
                 "provider": provider,
-                "code": "ollama_unavailable",
-                "message": "The local Ollama server could not be reached.",
-                "action": "Start Ollama with `ollama serve`, then resume the run.",
+                "code": "openai_unavailable",
+                "message": "The OpenAI API could not be reached.",
+                "action": "Check your network connection and OpenAI service status, then resume the run.",
                 "retryable": True,
             }
         return {
             "provider": provider,
-            "code": "ollama_request_failed",
-            "message": "The local model could not complete this step.",
-            "action": "Check that the Ollama model is available, then retry the run.",
+            "code": "openai_request_failed",
+            "message": "OpenAI could not complete this step.",
+            "action": "Check your OpenAI model and project configuration, then retry the run.",
             "retryable": True,
         }
 
@@ -117,26 +134,26 @@ def _provider_error(provider: str, exc: Exception) -> dict[str, Any]:
     }
 
 
-def _check_ollama_health() -> dict[str, Any]:
-    """Verify Ollama is reachable and the configured local model is installed."""
-    model_name = _ollama_model_name()
+def _check_openai_health() -> dict[str, Any]:
+    """Verify the OpenAI key and configured model are available."""
+    model_name = _openai_model_name()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "error",
+            "model": model_name,
+            "error": {
+                "provider": "openai",
+                "code": "openai_key_missing",
+                "message": "OPENAI_API_KEY is not configured.",
+                "action": "Add a valid OPENAI_API_KEY to .env, then restart the app.",
+            },
+        }
     try:
-        response = OllamaClient(host=_ollama_base_url(), timeout=3).list()
-        installed_models = {model.model for model in response.models}
-        if model_name not in installed_models:
-            return {
-                "status": "error",
-                "model": model_name,
-                "error": {
-                    "provider": "ollama",
-                    "code": "ollama_model_missing",
-                    "message": f"The local Ollama model '{model_name}' is not installed.",
-                    "action": f"Run `ollama pull {model_name}`.",
-                },
-            }
+        OpenAI(api_key=api_key, timeout=3).models.retrieve(model_name)
         return {"status": "ok", "model": model_name}
     except Exception as exc:
-        return {"status": "error", "model": model_name, "error": _provider_error("ollama", exc)}
+        return {"status": "error", "model": model_name, "error": _provider_error("openai", exc)}
 
 
 def _check_tavily_health() -> dict[str, Any]:
@@ -374,7 +391,7 @@ def _run_graph(thread_id: str, input_state: AgentState | None) -> None:
             if failed_node == "researcher":
                 provider_error = _provider_error("tavily", exc)
             elif failed_node in {"planner", "critic", "synthesizer"}:
-                provider_error = _provider_error("ollama", exc)
+                provider_error = _provider_error("openai", exc)
             else:
                 provider_error = {
                     "provider": "workflow",
@@ -437,7 +454,7 @@ class ResearchRequestHandler(BaseHTTPRequestHandler):
             self._stream_events(parsed.path.removeprefix("/api/events/"), parsed.query)
         elif parsed.path == "/api/health":
             providers = {
-                "ollama": _check_ollama_health(),
+                "openai": _check_openai_health(),
                 "tavily": _check_tavily_health(),
             }
             status = (
